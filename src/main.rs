@@ -70,6 +70,8 @@ struct FetchRequest {
     #[serde(default)]
     proxy: ProxySelection,
     #[serde(default)]
+    proxy_url: Option<String>,
+    #[serde(default)]
     timeout_ms: Option<u64>,
     #[serde(default)]
     follow_redirects: Option<bool>,
@@ -283,6 +285,9 @@ fn validate_request(config: &Config, request: &FetchRequest) -> Result<()> {
     if request.body_base64.is_some() && request.body_text.is_some() {
         return Err(anyhow!("send only one of body_base64 or body_text"));
     }
+    if request.proxy_url.is_some() && !matches!(request.proxy, ProxySelection::Direct) {
+        return Err(anyhow!("send only one of proxy_url or proxy"));
+    }
     if request.danger_accept_invalid_certs.unwrap_or(false) && !config.allow_invalid_certs {
         return Err(anyhow!(
             "danger_accept_invalid_certs requires ALLOW_INVALID_CERTS=true"
@@ -335,7 +340,7 @@ async fn execute_fetch(state: AppState, request: FetchRequest) -> Result<FetchRe
         return Err(anyhow!("request body exceeds MAX_BODY_BYTES"));
     }
 
-    let proxy_used = select_proxy(&state, &request.proxy).await?;
+    let proxy_used = select_proxy(&state, &request).await?;
     let client = build_client(
         Duration::from_millis(timeout_ms),
         request.follow_redirects.unwrap_or(true),
@@ -485,9 +490,12 @@ async fn store_set_cookies(state: &AppState, jar_name: &str, set_cookies: &[Stri
     }
 }
 
-async fn select_proxy(state: &AppState, selection: &ProxySelection) -> Result<Option<String>> {
+async fn select_proxy(state: &AppState, request: &FetchRequest) -> Result<Option<String>> {
+    if let Some(url) = &request.proxy_url {
+        return Ok(Some(url.clone()));
+    }
     let pool = state.proxy_pool.read().await;
-    match selection {
+    match &request.proxy {
         ProxySelection::Direct => Ok(None),
         ProxySelection::Url(url) => Ok(Some(url.clone())),
         ProxySelection::Random => {
@@ -620,6 +628,7 @@ mod tests {
             body_text: None,
             cookie_jar: None,
             proxy: ProxySelection::Direct,
+            proxy_url: None,
             timeout_ms: None,
             follow_redirects: None,
             danger_accept_invalid_certs: None,
@@ -771,32 +780,53 @@ mod tests {
         let offset: FetchRequest =
             serde_json::from_str(r#"{"url":"https://example.com","proxy":{"offset":1}}"#).unwrap();
         assert!(matches!(offset.proxy, ProxySelection::Offset(1)));
+
+        let proxy_url: FetchRequest = serde_json::from_str(
+            r#"{"url":"https://example.com","proxy_url":"http://proxy.example:8000"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            proxy_url.proxy_url.as_deref(),
+            Some("http://proxy.example:8000")
+        );
+    }
+
+    #[test]
+    fn rejects_multiple_proxy_selection_inputs() {
+        let config = config_for_tests();
+        let mut request = request_for_tests("https://example.com");
+        request.proxy_url = Some("http://proxy.example:8000".to_string());
+        request.proxy = ProxySelection::Random;
+
+        let err = validate_request(&config, &request).unwrap_err().to_string();
+        assert!(err.contains("send only one of proxy_url or proxy"));
     }
 
     #[tokio::test]
     async fn selects_explicit_and_offset_proxies() {
         let state = state_with_pool(vec!["http://one.example:8000", "http://two.example:8000"]);
 
+        let mut request = request_for_tests("https://example.com");
+        request.proxy_url = Some("http://request.example:8000".to_string());
         assert_eq!(
-            select_proxy(
-                &state,
-                &ProxySelection::Url("http://manual.example:8000".to_string())
-            )
-            .await
-            .unwrap(),
+            select_proxy(&state, &request).await.unwrap(),
+            Some("http://request.example:8000".to_string())
+        );
+
+        let mut request = request_for_tests("https://example.com");
+        request.proxy = ProxySelection::Url("http://manual.example:8000".to_string());
+        assert_eq!(
+            select_proxy(&state, &request).await.unwrap(),
             Some("http://manual.example:8000".to_string())
         );
+        let mut request = request_for_tests("https://example.com");
+        request.proxy = ProxySelection::Offset(1);
         assert_eq!(
-            select_proxy(&state, &ProxySelection::Offset(1))
-                .await
-                .unwrap(),
+            select_proxy(&state, &request).await.unwrap(),
             Some("http://two.example:8000".to_string())
         );
-        assert!(
-            select_proxy(&state, &ProxySelection::Offset(2))
-                .await
-                .is_err()
-        );
+        request.proxy = ProxySelection::Offset(2);
+        assert!(select_proxy(&state, &request).await.is_err());
     }
 
     #[test]

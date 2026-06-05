@@ -15,8 +15,7 @@ server-side client.
 - Base64 or text request bodies.
 - Per-request headers.
 - Server-side named cookie jars for stateful portal flows.
-- Direct, explicit proxy URL, random proxy, or offset proxy selection.
-- Optional proxy pool loaded from env or fetched on boot.
+- Direct fetches or caller-supplied upstream HTTP/SOCKS proxy URLs.
 - Host allowlist and private-IP blocking to reduce SSRF risk.
 - Concurrent fetch cap and streaming response body limit.
 - Optional per-request invalid-cert escape hatch for broken public portals.
@@ -100,34 +99,22 @@ ALLOW_INVALID_CERTS=true cargo run
 }
 ```
 
-## Proxy Pool
+## Upstream Proxy
 
-Static pool from environment:
+Pass upstream proxy credentials with the request:
 
-```bash
-PROXIES='http://user:pass@1.2.3.4:8000,http://user:pass@5.6.7.8:8000'
-PROXIES2='http://user:pass@9.10.11.12:8000'
+```json
+{
+  "url": "https://example.gov/",
+  "proxy_url": "http://user:pass@host:port"
+}
 ```
 
-`PROXY_POOL` is also supported as a legacy alias. `PROXIES`, `PROXIES2`,
-`PROXIES3`, etc. are read in numeric order so large pools can be split across
-multiple environment variables or Fly secrets.
-
-Fetch-on-boot pool:
-
-```bash
-PROXY_POOL_URL=https://example.com/proxies.txt
-PROXY_POOL_TOKEN=secret
-PROXY_POOL_REFRESH_SECONDS=300
-```
-
-Request modes:
+The older `proxy` object shape is also accepted:
 
 ```json
 { "proxy": "direct" }
 { "proxy": { "url": "http://user:pass@host:port" } }
-{ "proxy": "random" }
-{ "proxy": { "offset": 1 } }
 ```
 
 ## Configuration
@@ -143,11 +130,6 @@ Request modes:
 | `MAX_RPC_BYTES` | `10489856` | Max JSON RPC request size |
 | `MAX_CONCURRENT_REQUESTS` | `64` | Max simultaneous delegated upstream fetches |
 | `DEFAULT_TIMEOUT_MS` | `45000` | Upstream request timeout |
-| `PROXIES`, `PROXIES2`, ... | unset | Inline comma/newline proxy pool chunks |
-| `PROXY_POOL` | unset | Legacy inline comma/newline proxy pool |
-| `PROXY_POOL_URL` | unset | Fetch proxy pool from URL |
-| `PROXY_POOL_TOKEN` | unset | Bearer token for pool URL |
-| `PROXY_POOL_REFRESH_SECONDS` | `300` | Refresh interval |
 
 ## Fly
 
@@ -163,6 +145,6 @@ For the DirtSignal Fly deployment that scales to zero:
 
 ```bash
 fly apps create dirtsignal-delegated-proxy
-fly secrets set DELEGATED_HTTP_TOKEN=... PROXIES='...'
+fly secrets set DELEGATED_HTTP_TOKEN=...
 fly deploy -c fly-proxy.toml
 ```
