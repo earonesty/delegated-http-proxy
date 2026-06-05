@@ -12,13 +12,14 @@ axum = "0.8"
 base64 = "0.22"
 bytes = "1.11"
 cookie = "0.18"
+futures-util = "0.3"
 hex = "0.4"
 http = "1.4"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli", "deflate", "cookies", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli", "deflate", "cookies", "socks", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

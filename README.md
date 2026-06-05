@@ -18,6 +18,7 @@ server-side client.
 - Direct, explicit proxy URL, random proxy, or offset proxy selection.
 - Optional proxy pool loaded from env or fetched on boot.
 - Host allowlist and private-IP blocking to reduce SSRF risk.
+- Concurrent fetch cap and streaming response body limit.
 - Optional per-request invalid-cert escape hatch for broken public portals.
 - MIT licensed.
 
@@ -134,6 +135,8 @@ Request modes:
 | `DENY_PRIVATE_IPS` | `true` | Block private/link-local/loopback resolved IPs |
 | `ALLOW_INVALID_CERTS` | `false` | Permit per-request `danger_accept_invalid_certs` |
 | `MAX_BODY_BYTES` | `10485760` | Max request and response body size |
+| `MAX_RPC_BYTES` | `10489856` | Max JSON RPC request size |
+| `MAX_CONCURRENT_REQUESTS` | `64` | Max simultaneous delegated upstream fetches |
 | `DEFAULT_TIMEOUT_MS` | `45000` | Upstream request timeout |
 | `PROXY_POOL` | unset | Inline comma/newline proxy pool |
 | `PROXY_POOL_URL` | unset | Fetch proxy pool from URL |

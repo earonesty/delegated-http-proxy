@@ -9,18 +9,20 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use bytes::Bytes;
+use futures_util::StreamExt;
 use reqwest::{
     Client, Method, Proxy,
     header::{HeaderName, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use url::Url;
@@ -33,6 +35,7 @@ struct AppState {
     config: Arc<Config>,
     cookie_jars: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
     proxy_pool: Arc<RwLock<Vec<String>>>,
+    fetch_slots: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -43,6 +46,8 @@ struct Config {
     deny_private_ips: bool,
     allow_invalid_certs: bool,
     max_body_bytes: usize,
+    max_rpc_bytes: usize,
+    max_concurrent_requests: usize,
     default_timeout_ms: u64,
     proxy_pool_url: Option<String>,
     proxy_pool_token: Option<String>,
@@ -116,6 +121,7 @@ async fn main() -> Result<()> {
         proxy_pool: Arc::new(RwLock::new(
             load_proxy_pool(&config).await.unwrap_or_default(),
         )),
+        fetch_slots: Arc::new(Semaphore::new(config.max_concurrent_requests)),
     };
 
     if config.proxy_pool_url.is_some() && config.proxy_pool_refresh_seconds > 0 {
@@ -126,6 +132,7 @@ async fn main() -> Result<()> {
         .route("/healthz", get(healthz))
         .route("/v1/fetch", post(fetch_handler))
         .with_state(state)
+        .layer(DefaultBodyLimit::max(config.max_rpc_bytes))
         .layer(TraceLayer::new_for_http());
 
     info!("listening on {}", config.bind);
@@ -156,6 +163,8 @@ impl Config {
             deny_private_ips: parse_bool_env("DENY_PRIVATE_IPS", true),
             allow_invalid_certs: parse_bool_env("ALLOW_INVALID_CERTS", false),
             max_body_bytes: parse_usize_env("MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
+            max_rpc_bytes: parse_usize_env("MAX_RPC_BYTES", DEFAULT_MAX_BODY_BYTES + 4096),
+            max_concurrent_requests: parse_usize_env("MAX_CONCURRENT_REQUESTS", 64),
             default_timeout_ms: parse_u64_env("DEFAULT_TIMEOUT_MS", DEFAULT_TIMEOUT_MS),
             proxy_pool_url: env::var("PROXY_POOL_URL").ok().filter(|s| !s.is_empty()),
             proxy_pool_token: env::var("PROXY_POOL_TOKEN").ok().filter(|s| !s.is_empty()),
@@ -209,6 +218,11 @@ async fn fetch_handler(
         Err(err) => return error(StatusCode::FORBIDDEN, err),
     }
 
+    let _permit = match acquire_fetch_slot(&state) {
+        Ok(permit) => permit,
+        Err(err) => return error(StatusCode::TOO_MANY_REQUESTS, err),
+    };
+
     match execute_fetch(state, request).await {
         Ok(response) => (
             StatusCode::OK,
@@ -216,6 +230,14 @@ async fn fetch_handler(
         ),
         Err(err) => error(StatusCode::BAD_GATEWAY, err),
     }
+}
+
+fn acquire_fetch_slot(state: &AppState) -> Result<OwnedSemaphorePermit> {
+    state
+        .fetch_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| anyhow!("too many concurrent fetches"))
 }
 
 fn error(status: StatusCode, err: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
@@ -359,13 +381,7 @@ async fn execute_fetch(state: AppState, request: FetchRequest) -> Result<FetchRe
         store_set_cookies(&state, jar_name, &set_cookies).await;
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .context("failed to read response body")?;
-    if bytes.len() > state.config.max_body_bytes {
-        return Err(anyhow!("response body exceeds MAX_BODY_BYTES"));
-    }
+    let bytes = read_limited_body(response, state.config.max_body_bytes).await?;
     let body_sha256 = hex::encode(Sha256::digest(&bytes));
     Ok(FetchResponse {
         status,
@@ -377,6 +393,25 @@ async fn execute_fetch(state: AppState, request: FetchRequest) -> Result<FetchRe
         proxy_used,
         body_sha256,
     })
+}
+
+async fn read_limited_body(response: reqwest::Response, max_bytes: usize) -> Result<Bytes> {
+    if let Some(length) = response.content_length() {
+        if length > max_bytes as u64 {
+            return Err(anyhow!("response body exceeds MAX_BODY_BYTES"));
+        }
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("failed to read response body")?;
+        if body.len() + chunk.len() > max_bytes {
+            return Err(anyhow!("response body exceeds MAX_BODY_BYTES"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
 }
 
 fn decode_body(request: &FetchRequest) -> Result<Vec<u8>> {
@@ -523,4 +558,242 @@ fn spawn_proxy_pool_refresh(state: AppState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    fn config_for_tests() -> Config {
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            bearer_token: "test-token".to_string(),
+            allow_hosts: None,
+            deny_private_ips: false,
+            allow_invalid_certs: false,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_rpc_bytes: DEFAULT_MAX_BODY_BYTES + 4096,
+            max_concurrent_requests: 64,
+            default_timeout_ms: DEFAULT_TIMEOUT_MS,
+            proxy_pool_url: None,
+            proxy_pool_token: None,
+            proxy_pool_refresh_seconds: 300,
+        }
+    }
+
+    fn request_for_tests(url: &str) -> FetchRequest {
+        FetchRequest {
+            url: url.to_string(),
+            method: default_method(),
+            headers: HashMap::new(),
+            body_base64: None,
+            body_text: None,
+            cookie_jar: None,
+            proxy: ProxySelection::Direct,
+            timeout_ms: None,
+            follow_redirects: None,
+            danger_accept_invalid_certs: None,
+        }
+    }
+
+    fn state_with_pool(pool: Vec<&str>) -> AppState {
+        AppState {
+            config: Arc::new(config_for_tests()),
+            cookie_jars: Arc::new(RwLock::new(HashMap::new())),
+            proxy_pool: Arc::new(RwLock::new(
+                pool.into_iter().map(ToString::to_string).collect(),
+            )),
+            fetch_slots: Arc::new(Semaphore::new(64)),
+        }
+    }
+
+    #[test]
+    fn parses_allow_hosts_case_insensitively() {
+        let hosts = parse_host_set(Some(" Example.COM,api.example.com ,, ".to_string())).unwrap();
+
+        assert!(hosts.contains("example.com"));
+        assert!(hosts.contains("api.example.com"));
+        assert_eq!(hosts.len(), 2);
+    }
+
+    #[test]
+    fn parses_proxy_pool_from_lines_and_commas() {
+        let proxies = parse_proxy_text(
+            "
+            # ignored
+            http://one.example:8000, socks5://two.example:9000
+
+            http://three.example:7000
+            ",
+        );
+
+        assert_eq!(
+            proxies,
+            vec![
+                "http://one.example:8000",
+                "socks5://two.example:9000",
+                "http://three.example:7000"
+            ]
+        );
+    }
+
+    #[test]
+    fn decodes_text_and_base64_bodies() {
+        let mut text_request = request_for_tests("https://example.com");
+        text_request.body_text = Some("hello".to_string());
+        assert_eq!(decode_body(&text_request).unwrap(), b"hello");
+
+        let mut b64_request = request_for_tests("https://example.com");
+        b64_request.body_base64 = Some(B64.encode("hello"));
+        assert_eq!(decode_body(&b64_request).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn rejects_ambiguous_body_inputs() {
+        let config = config_for_tests();
+        let mut request = request_for_tests("https://example.com");
+        request.body_text = Some("hello".to_string());
+        request.body_base64 = Some(B64.encode("hello"));
+
+        let err = validate_request(&config, &request).unwrap_err().to_string();
+        assert!(err.contains("send only one"));
+    }
+
+    #[test]
+    fn enforces_host_allowlist() {
+        let mut config = config_for_tests();
+        config.allow_hosts = Some(HashSet::from(["allowed.example".to_string()]));
+
+        assert!(
+            validate_request(&config, &request_for_tests("https://allowed.example/path")).is_ok()
+        );
+        let err = validate_request(&config, &request_for_tests("https://blocked.example/path"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ALLOW_HOSTS"));
+    }
+
+    #[test]
+    fn rejects_private_destinations_when_enabled() {
+        let mut config = config_for_tests();
+        config.deny_private_ips = true;
+
+        let err = validate_request(&config, &request_for_tests("http://127.0.0.1/status"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("private/link-local/loopback"));
+    }
+
+    #[test]
+    fn gates_invalid_cert_override() {
+        let config = config_for_tests();
+        let mut request = request_for_tests("https://example.com");
+        request.danger_accept_invalid_certs = Some(true);
+
+        let err = validate_request(&config, &request).unwrap_err().to_string();
+        assert!(err.contains("ALLOW_INVALID_CERTS"));
+
+        let mut allowed_config = config_for_tests();
+        allowed_config.allow_invalid_certs = true;
+        assert!(validate_request(&allowed_config, &request).is_ok());
+    }
+
+    #[test]
+    fn parses_proxy_selection_request_shapes() {
+        let random: FetchRequest =
+            serde_json::from_str(r#"{"url":"https://example.com","proxy":"random"}"#).unwrap();
+        assert!(matches!(random.proxy, ProxySelection::Random));
+
+        let explicit: FetchRequest = serde_json::from_str(
+            r#"{"url":"https://example.com","proxy":{"url":"http://proxy.example:8000"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            explicit.proxy,
+            ProxySelection::Url(ref url) if url == "http://proxy.example:8000"
+        ));
+
+        let offset: FetchRequest =
+            serde_json::from_str(r#"{"url":"https://example.com","proxy":{"offset":1}}"#).unwrap();
+        assert!(matches!(offset.proxy, ProxySelection::Offset(1)));
+    }
+
+    #[tokio::test]
+    async fn selects_explicit_and_offset_proxies() {
+        let state = state_with_pool(vec!["http://one.example:8000", "http://two.example:8000"]);
+
+        assert_eq!(
+            select_proxy(
+                &state,
+                &ProxySelection::Url("http://manual.example:8000".to_string())
+            )
+            .await
+            .unwrap(),
+            Some("http://manual.example:8000".to_string())
+        );
+        assert_eq!(
+            select_proxy(&state, &ProxySelection::Offset(1))
+                .await
+                .unwrap(),
+            Some("http://two.example:8000".to_string())
+        );
+        assert!(
+            select_proxy(&state, &ProxySelection::Offset(2))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_fetches_when_concurrency_limit_is_exhausted() {
+        let mut state = state_with_pool(vec![]);
+        state.fetch_slots = Arc::new(Semaphore::new(1));
+
+        let _permit = acquire_fetch_slot(&state).unwrap();
+        let err = acquire_fetch_slot(&state).unwrap_err().to_string();
+        assert!(err.contains("too many concurrent fetches"));
+    }
+
+    #[tokio::test]
+    async fn stores_set_cookies_in_named_jars() {
+        let state = state_with_pool(vec![]);
+        store_set_cookies(
+            &state,
+            "portal",
+            &[
+                "SESSION=abc123; Path=/; HttpOnly".to_string(),
+                "csrf=token; Path=/".to_string(),
+            ],
+        )
+        .await;
+
+        let header = cookie_header_for_jar(&state, "portal").await.unwrap();
+        assert!(header.contains("SESSION=abc123"));
+        assert!(header.contains("csrf=token"));
+    }
+
+    #[tokio::test]
+    async fn rejects_large_responses_before_buffering_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .await
+                .unwrap();
+        });
+
+        let response = Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        let err = read_limited_body(response, 4)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MAX_BODY_BYTES"));
+    }
 }
