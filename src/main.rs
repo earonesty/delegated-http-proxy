@@ -54,7 +54,7 @@ struct Config {
     proxy_pool_refresh_seconds: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct FetchRequest {
     url: String,
     #[serde(default = "default_method")]
@@ -79,7 +79,7 @@ struct FetchRequest {
     danger_accept_invalid_certs: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ProxySelection {
     #[default]
@@ -104,6 +104,21 @@ struct FetchResponse {
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+    error_kind: String,
+    error_chain: Vec<String>,
+    error_debug: String,
+    request: Option<ErrorRequestContext>,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorRequestContext {
+    method: String,
+    url: String,
+    proxy_requested: bool,
+    proxy_url: Option<String>,
+    elapsed_ms: u128,
+    #[serde(skip)]
+    raw_proxy_url: Option<String>,
 }
 
 fn default_method() -> String {
@@ -217,20 +232,26 @@ async fn fetch_handler(
     match authorize(&state.config, &headers).and_then(|_| validate_request(&state.config, &request))
     {
         Ok(()) => {}
-        Err(err) => return error(StatusCode::FORBIDDEN, err),
+        Err(err) => return error(StatusCode::FORBIDDEN, err, None),
     }
 
     let _permit = match acquire_fetch_slot(&state) {
         Ok(permit) => permit,
-        Err(err) => return error(StatusCode::TOO_MANY_REQUESTS, err),
+        Err(err) => return error(StatusCode::TOO_MANY_REQUESTS, err, None),
     };
 
+    let started = Instant::now();
+    let error_context = ErrorRequestContext::from_request(&request);
     match execute_fetch(state, request).await {
         Ok(response) => (
             StatusCode::OK,
             Json(serde_json::to_value(response).unwrap_or_else(|_| serde_json::json!({}))),
         ),
-        Err(err) => error(StatusCode::BAD_GATEWAY, err),
+        Err(err) => error(
+            StatusCode::BAD_GATEWAY,
+            err,
+            Some(error_context.with_elapsed(started.elapsed().as_millis())),
+        ),
     }
 }
 
@@ -242,16 +263,111 @@ fn acquire_fetch_slot(state: &AppState) -> Result<OwnedSemaphorePermit> {
         .map_err(|_| anyhow!("too many concurrent fetches"))
 }
 
-fn error(status: StatusCode, err: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
+fn error(
+    status: StatusCode,
+    err: anyhow::Error,
+    context: Option<ErrorRequestContext>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let secrets = context
+        .as_ref()
+        .and_then(|ctx| ctx.raw_proxy_url.as_deref())
+        .map(|url| vec![url.to_string()])
+        .unwrap_or_default();
+    let chain = err
+        .chain()
+        .map(|cause| redact_known_secrets(&cause.to_string(), &secrets))
+        .collect::<Vec<_>>();
+    let error = chain
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "unknown error".to_string());
+    let debug = redact_known_secrets(&format!("{err:?}"), &secrets);
     (
         status,
         Json(
             serde_json::to_value(ErrorResponse {
-                error: err.to_string(),
+                error,
+                error_kind: classify_error_kind(&chain),
+                error_chain: chain,
+                error_debug: debug,
+                request: context,
             })
             .unwrap(),
         ),
     )
+}
+
+impl ErrorRequestContext {
+    fn from_request(request: &FetchRequest) -> Self {
+        let raw_proxy_url = request
+            .proxy_url
+            .as_deref()
+            .or_else(|| match &request.proxy {
+                ProxySelection::Url(url) => Some(url.as_str()),
+                _ => None,
+            })
+            .map(ToString::to_string);
+        let proxy_url = raw_proxy_url.as_deref().map(redact_url_credentials);
+        Self {
+            method: request.method.clone(),
+            url: request.url.clone(),
+            proxy_requested: request.proxy_url.is_some()
+                || !matches!(request.proxy, ProxySelection::Direct),
+            proxy_url,
+            elapsed_ms: 0,
+            raw_proxy_url,
+        }
+    }
+
+    fn with_elapsed(mut self, elapsed_ms: u128) -> Self {
+        self.elapsed_ms = elapsed_ms;
+        self
+    }
+}
+
+fn classify_error_kind(chain: &[String]) -> String {
+    let joined = chain.join(" | ").to_ascii_lowercase();
+    if joined.contains("resolve") || joined.contains("dns") {
+        "dns".to_string()
+    } else if joined.contains("timeout") || joined.contains("timed out") {
+        "timeout".to_string()
+    } else if joined.contains("certificate") || joined.contains("tls") || joined.contains("ssl") {
+        "tls".to_string()
+    } else if joined.contains("proxy") {
+        "proxy".to_string()
+    } else if joined.contains("redirect") {
+        "redirect".to_string()
+    } else if joined.contains("body exceeds") {
+        "body_limit".to_string()
+    } else {
+        "upstream".to_string()
+    }
+}
+
+fn redact_known_secrets(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    for secret in secrets {
+        if secret.is_empty() {
+            continue;
+        }
+        out = out.replace(secret, &redact_url_credentials(secret));
+    }
+    out
+}
+
+fn redact_url_credentials(value: &str) -> String {
+    match Url::parse(value) {
+        Ok(mut url) => {
+            if !url.username().is_empty() {
+                let _ = url.set_username("***");
+            }
+            if url.password().is_some() {
+                let _ = url.set_password(Some("***"));
+            }
+            url.to_string()
+        }
+        Err(_) => value.to_string(),
+    }
 }
 
 fn authorize(config: &Config, headers: &HeaderMap) -> Result<()> {
@@ -800,6 +916,22 @@ mod tests {
 
         let err = validate_request(&config, &request).unwrap_err().to_string();
         assert!(err.contains("send only one of proxy_url or proxy"));
+    }
+
+    #[test]
+    fn classifies_errors_and_redacts_proxy_credentials() {
+        assert_eq!(
+            classify_error_kind(&["failed to resolve host example.invalid".to_string()]),
+            "dns"
+        );
+        assert_eq!(
+            classify_error_kind(&["operation timed out".to_string()]),
+            "timeout"
+        );
+        let raw = "http://user:password@proxy.example:8000";
+        let redacted = redact_known_secrets(&format!("proxy connect failed: {raw}"), &[raw.into()]);
+        assert!(redacted.contains("http://***:***@proxy.example:8000/"));
+        assert!(!redacted.contains("password"));
     }
 
     #[tokio::test]
