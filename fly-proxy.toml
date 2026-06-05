@@ -1,0 +1,30 @@
+app = "dirtsignal-delegated-proxy"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  ALLOW_INVALID_CERTS = "true"
+  DEFAULT_TIMEOUT_MS = "45000"
+  DENY_PRIVATE_IPS = "true"
+  MAX_BODY_BYTES = "10485760"
+  MAX_CONCURRENT_REQUESTS = "32"
+  MAX_RPC_BYTES = "10489856"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 24
+    hard_limit = 32
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256

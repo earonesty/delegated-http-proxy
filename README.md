@@ -105,8 +105,13 @@ ALLOW_INVALID_CERTS=true cargo run
 Static pool from environment:
 
 ```bash
-PROXY_POOL='http://user:pass@1.2.3.4:8000,http://user:pass@5.6.7.8:8000'
+PROXIES='http://user:pass@1.2.3.4:8000,http://user:pass@5.6.7.8:8000'
+PROXIES2='http://user:pass@9.10.11.12:8000'
 ```
+
+`PROXY_POOL` is also supported as a legacy alias. `PROXIES`, `PROXIES2`,
+`PROXIES3`, etc. are read in numeric order so large pools can be split across
+multiple environment variables or Fly secrets.
 
 Fetch-on-boot pool:
 
@@ -138,7 +143,8 @@ Request modes:
 | `MAX_RPC_BYTES` | `10489856` | Max JSON RPC request size |
 | `MAX_CONCURRENT_REQUESTS` | `64` | Max simultaneous delegated upstream fetches |
 | `DEFAULT_TIMEOUT_MS` | `45000` | Upstream request timeout |
-| `PROXY_POOL` | unset | Inline comma/newline proxy pool |
+| `PROXIES`, `PROXIES2`, ... | unset | Inline comma/newline proxy pool chunks |
+| `PROXY_POOL` | unset | Legacy inline comma/newline proxy pool |
 | `PROXY_POOL_URL` | unset | Fetch proxy pool from URL |
 | `PROXY_POOL_TOKEN` | unset | Bearer token for pool URL |
 | `PROXY_POOL_REFRESH_SECONDS` | `300` | Refresh interval |
@@ -152,3 +158,11 @@ fly deploy
 ```
 
 See `Dockerfile` for the tiny runtime image.
+
+For the DirtSignal Fly deployment that scales to zero:
+
+```bash
+fly apps create dirtsignal-delegated-proxy
+fly secrets set DELEGATED_HTTP_TOKEN=... PROXIES='...'
+fly deploy -c fly-proxy.toml
+```

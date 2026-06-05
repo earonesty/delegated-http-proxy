@@ -529,10 +529,39 @@ async fn load_proxy_pool(config: &Config) -> Result<Vec<String>> {
 }
 
 fn parse_proxy_env() -> Vec<String> {
-    env::var("PROXY_POOL")
-        .ok()
-        .map(|s| parse_proxy_text(&s))
-        .unwrap_or_default()
+    parse_proxy_env_vars(env::vars())
+}
+
+fn parse_proxy_env_vars<I, K, V>(vars: I) -> Vec<String>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let mut chunks = vars
+        .into_iter()
+        .filter_map(|(key, value)| proxy_env_rank(key.as_ref()).map(|rank| (rank, value)))
+        .collect::<Vec<_>>();
+    chunks.sort_by_key(|(rank, _)| *rank);
+    chunks
+        .into_iter()
+        .flat_map(|(_, value)| parse_proxy_text(value.as_ref()))
+        .collect()
+}
+
+fn proxy_env_rank(key: &str) -> Option<usize> {
+    if key == "PROXIES" {
+        return Some(1);
+    }
+    if let Some(suffix) = key.strip_prefix("PROXIES") {
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return suffix.parse().ok();
+        }
+    }
+    if key == "PROXY_POOL" {
+        return Some(usize::MAX);
+    }
+    None
 }
 
 fn parse_proxy_text(text: &str) -> Vec<String> {
@@ -634,6 +663,31 @@ mod tests {
                 "http://one.example:8000",
                 "socks5://two.example:9000",
                 "http://three.example:7000"
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_chunked_proxy_env_vars_in_order() {
+        let proxies = parse_proxy_env_vars([
+            ("PROXIES3", "http://three.example:8000"),
+            ("IGNORED", "http://ignored.example:8000"),
+            ("PROXY_POOL", "http://legacy.example:8000"),
+            (
+                "PROXIES",
+                "http://one.example:8000,http://also-one.example:8000",
+            ),
+            ("PROXIES2", "http://two.example:8000"),
+        ]);
+
+        assert_eq!(
+            proxies,
+            vec![
+                "http://one.example:8000",
+                "http://also-one.example:8000",
+                "http://two.example:8000",
+                "http://three.example:8000",
+                "http://legacy.example:8000"
             ]
         );
     }
