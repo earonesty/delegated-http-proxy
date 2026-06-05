@@ -229,11 +229,22 @@ async fn fetch_handler(
     headers: HeaderMap,
     Json(request): Json<FetchRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let started = Instant::now();
     let error_context = ErrorRequestContext::from_request(&request);
     match authorize(&state.config, &headers).and_then(|_| validate_request(&state.config, &request))
     {
         Ok(()) => {}
-        Err(err) => return error(StatusCode::FORBIDDEN, err, Some(error_context.clone())),
+        Err(err) => {
+            return error(
+                StatusCode::FORBIDDEN,
+                err,
+                Some(
+                    error_context
+                        .clone()
+                        .with_elapsed(started.elapsed().as_millis()),
+                ),
+            );
+        }
     }
 
     let _permit = match acquire_fetch_slot(&state) {
@@ -242,12 +253,15 @@ async fn fetch_handler(
             return error(
                 StatusCode::TOO_MANY_REQUESTS,
                 err,
-                Some(error_context.clone()),
+                Some(
+                    error_context
+                        .clone()
+                        .with_elapsed(started.elapsed().as_millis()),
+                ),
             );
         }
     };
 
-    let started = Instant::now();
     match execute_fetch(state, request).await {
         Ok(response) => (
             StatusCode::OK,
