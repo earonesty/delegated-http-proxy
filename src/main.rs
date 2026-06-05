@@ -110,7 +110,7 @@ struct ErrorResponse {
     request: Option<ErrorRequestContext>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ErrorRequestContext {
     method: String,
     url: String,
@@ -229,19 +229,25 @@ async fn fetch_handler(
     headers: HeaderMap,
     Json(request): Json<FetchRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let error_context = ErrorRequestContext::from_request(&request);
     match authorize(&state.config, &headers).and_then(|_| validate_request(&state.config, &request))
     {
         Ok(()) => {}
-        Err(err) => return error(StatusCode::FORBIDDEN, err, None),
+        Err(err) => return error(StatusCode::FORBIDDEN, err, Some(error_context.clone())),
     }
 
     let _permit = match acquire_fetch_slot(&state) {
         Ok(permit) => permit,
-        Err(err) => return error(StatusCode::TOO_MANY_REQUESTS, err, None),
+        Err(err) => {
+            return error(
+                StatusCode::TOO_MANY_REQUESTS,
+                err,
+                Some(error_context.clone()),
+            );
+        }
     };
 
     let started = Instant::now();
-    let error_context = ErrorRequestContext::from_request(&request);
     match execute_fetch(state, request).await {
         Ok(response) => (
             StatusCode::OK,
